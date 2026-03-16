@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "defaults": {
+    "allow": true
+  },
+  "agents": {
+    "main": {
+      "allowlist": [
+        { "pattern": "/usr/bin/*" },
+        { "pattern": "/usr/local/bin/*" },
+        { "pattern": "/bin/*" },
+        { "pattern": "git *" },
+        { "pattern": "npm *" },
+        { "pattern": "node *" },
+        { "pattern": "cd *" },
+        { "pattern": "ls *" },
+        { "pattern": "cat *" },
+        { "pattern": "echo *" },
+        { "pattern": "mkdir *" },
+        { "pattern": "gh *" },
+        { "pattern": "curl *" }
+      ]
+    }
+  }
+}
