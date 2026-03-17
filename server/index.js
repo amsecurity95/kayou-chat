@@ -1,121 +1,250 @@
 const path = require('path')
+const fs = require('fs')
 const fastify = require('fastify')({ logger: true })
 const cors = require('@fastify/cors')
 const fastifyStatic = require('@fastify/static')
 const { Server } = require('socket.io')
 
-// Setup CORS
-fastify.register(cors, {
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE']
+const { execSync } = require('child_process')
+
+const CONFIG_PATH = path.join(__dirname, '..', 'kayou-config.json')
+const UPLOADS_DIR = path.join(__dirname, '..', 'out', 'uploads')
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true })
+
+function loadConfig() {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'))
+  } catch (e) { console.error('Config load error:', e.message) }
+  return { agents: [], webhookSecret: '', github: {}, rules: [], mcps: [], projects: [], services: [] }
+}
+function saveConfig(config) { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)) }
+
+fastify.register(cors, { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] })
+fastify.register(fastifyStatic, { root: path.join(__dirname, '..', 'out'), prefix: '/' })
+fastify.get('/health', async () => ({ status: 'ok' }))
+
+// ══════════════ AGENTS ══════════════
+fastify.get('/api/config/agents', async () => {
+  const c = loadConfig()
+  return c.agents.map(a => ({ ...a, apiKey: a.apiKey ? '••••' + a.apiKey.slice(-4) : '', hasKey: !!a.apiKey }))
+})
+fastify.put('/api/config/agents/:id', async (req, reply) => {
+  const c = loadConfig(); const idx = c.agents.findIndex(a => a.id === req.params.id)
+  if (idx === -1) return reply.code(404).send({ error: 'Not found' })
+  const u = req.body; const a = c.agents[idx]
+  if (u.apiKey && !u.apiKey.startsWith('••••')) a.apiKey = u.apiKey
+  ;['name','model','systemPrompt','enabled','provider','color'].forEach(k => { if (u[k] !== undefined) a[k] = u[k] })
+  if (u.permissions) a.permissions = u.permissions
+  if (u.tasks) a.tasks = u.tasks
+  c.agents[idx] = a; saveConfig(c)
+  return { ...a, apiKey: a.apiKey ? '••••' + a.apiKey.slice(-4) : '', hasKey: !!a.apiKey }
+})
+fastify.post('/api/config/agents', async (req) => {
+  const c = loadConfig(); const { name, provider, apiKey, model, systemPrompt, color } = req.body
+  const agent = { id: name.toLowerCase().replace(/[^a-z0-9]/g, '-'), name, provider: provider || 'anthropic', apiKey: apiKey || '', model: model || 'claude-sonnet-4-20250514', systemPrompt: systemPrompt || '', enabled: false, color: color || '#6366F1', permissions: ['projects','mcps'] }
+  c.agents.push(agent); saveConfig(c)
+  return { ...agent, apiKey: agent.apiKey ? '••••' + agent.apiKey.slice(-4) : '', hasKey: !!agent.apiKey }
+})
+fastify.delete('/api/config/agents/:id', async (req) => {
+  const c = loadConfig(); c.agents = c.agents.filter(a => a.id !== req.params.id); saveConfig(c); return { ok: true }
 })
 
-// Serve Next.js static export
-fastify.register(fastifyStatic, {
-  root: path.join(__dirname, '..', 'out'),
-  prefix: '/',
+// ══════════════ RULES ══════════════
+fastify.get('/api/config/rules', async () => loadConfig().rules || [])
+fastify.put('/api/config/rules', async (req) => {
+  const c = loadConfig(); c.rules = req.body.rules || []; saveConfig(c); return c.rules
 })
 
-// Health check
-fastify.get('/health', async () => {
-  return { status: 'ok', timestamp: new Date().toISOString() }
+// ══════════════ GITHUB ══════════════
+fastify.get('/api/config/github', async () => {
+  const c = loadConfig(); return { username: c.github?.username || '', hasToken: !!(c.github?.token) }
+})
+fastify.put('/api/config/github', async (req) => {
+  const c = loadConfig(); if (!c.github) c.github = {}
+  if (req.body.username !== undefined) c.github.username = req.body.username
+  if (req.body.token && !req.body.token.startsWith('••••')) c.github.token = req.body.token
+  saveConfig(c); return { username: c.github.username, hasToken: !!c.github.token }
 })
 
-// Mock data - replace with PostgreSQL queries
-let messages = []
-let users = [
-  { id: '1', username: 'Kayou Code', online: true },
-  { id: '2', username: 'Aimar', online: true },
-  { id: '3', username: 'Berenice', online: false },
-  { id: '4', username: 'Elite ICT', online: true },
-]
-
-// API Routes
-fastify.get('/api/users', async (request, reply) => {
-  return users
+// ══════════════ MCPs ══════════════
+fastify.get('/api/config/mcps', async () => loadConfig().mcps || [])
+fastify.post('/api/config/mcps', async (req) => {
+  const c = loadConfig(); if (!c.mcps) c.mcps = []
+  const mcp = { id: Date.now().toString(), ...req.body, createdAt: new Date().toISOString() }
+  c.mcps.push(mcp); saveConfig(c); return mcp
+})
+fastify.put('/api/config/mcps/:id', async (req, reply) => {
+  const c = loadConfig(); const idx = (c.mcps || []).findIndex(m => m.id === req.params.id)
+  if (idx === -1) return reply.code(404).send({ error: 'Not found' })
+  c.mcps[idx] = { ...c.mcps[idx], ...req.body }; saveConfig(c); return c.mcps[idx]
+})
+fastify.delete('/api/config/mcps/:id', async (req) => {
+  const c = loadConfig(); c.mcps = (c.mcps || []).filter(m => m.id !== req.params.id); saveConfig(c); return { ok: true }
 })
 
-fastify.get('/api/messages/:userId/:otherId', async (request, reply) => {
-  const { userId, otherId } = request.params
-  const filtered = messages.filter(
-    m => (m.senderId === userId && m.receiverId === otherId) ||
-         (m.senderId === otherId && m.receiverId === userId)
-  )
-  return filtered.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+// ══════════════ PROJECTS ══════════════
+fastify.get('/api/projects', async () => loadConfig().projects || [])
+fastify.post('/api/projects', async (req) => {
+  const c = loadConfig(); if (!c.projects) c.projects = []
+  const project = { id: Date.now().toString(), ...req.body, progress: req.body.progress || 0, createdAt: new Date().toISOString() }
+  c.projects.push(project); saveConfig(c); return project
+})
+fastify.put('/api/projects/:id', async (req, reply) => {
+  const c = loadConfig(); const idx = (c.projects || []).findIndex(p => p.id === req.params.id)
+  if (idx === -1) return reply.code(404).send({ error: 'Not found' })
+  c.projects[idx] = { ...c.projects[idx], ...req.body }; saveConfig(c); return c.projects[idx]
+})
+fastify.delete('/api/projects/:id', async (req) => {
+  const c = loadConfig(); c.projects = (c.projects || []).filter(p => p.id !== req.params.id); saveConfig(c); return { ok: true }
 })
 
-fastify.post('/api/messages', async (request, reply) => {
-  const { content, senderId, receiverId } = request.body
-  const message = {
-    id: Date.now().toString(),
-    content,
-    senderId,
-    receiverId,
-    createdAt: new Date().toISOString()
+// ══════════════ SERVICES (webhooks/external) ══════════════
+fastify.get('/api/config/services', async () => loadConfig().services || [])
+fastify.post('/api/config/services', async (req) => {
+  const c = loadConfig(); if (!c.services) c.services = []
+  const svc = { id: Date.now().toString(), ...req.body, createdAt: new Date().toISOString() }
+  c.services.push(svc); saveConfig(c); return svc
+})
+fastify.delete('/api/config/services/:id', async (req) => {
+  const c = loadConfig(); c.services = (c.services || []).filter(s => s.id !== req.params.id); saveConfig(c); return { ok: true }
+})
+
+// ══════════════ WEBHOOK ══════════════
+fastify.get('/api/config/webhook', async () => {
+  const c = loadConfig(); return { secret: c.webhookSecret, url: '/api/webhook/message' }
+})
+
+let io = null
+fastify.post('/api/webhook/message', async (req, reply) => {
+  const c = loadConfig()
+  if (req.body.secret !== c.webhookSecret) return reply.code(401).send({ error: 'Invalid secret' })
+  const message = { id: Date.now().toString(), channelId: req.body.channelId || 'general', senderId: req.body.agentId || 'webhook', content: req.body.content, ts: new Date().toISOString() }
+  if (io) io.emit('webhook:message', message)
+  return { ok: true, messageId: message.id }
+})
+
+// ══════════════ IMAGE UPLOAD ══════════════
+fastify.post('/api/upload', async (req, reply) => {
+  const { image, filename } = req.body // base64 image
+  if (!image) return reply.code(400).send({ error: 'No image' })
+  const ext = filename?.split('.').pop() || 'png'
+  const name = `${Date.now()}.${ext}`
+  const base64Data = image.replace(/^data:image\/\w+;base64,/, '')
+  fs.writeFileSync(path.join(UPLOADS_DIR, name), Buffer.from(base64Data, 'base64'))
+  return { url: `/uploads/${name}`, filename: name }
+})
+
+// ══════════════ SCREENSHOT ══════════════
+fastify.post('/api/screenshot', async (req, reply) => {
+  try {
+    const name = `screenshot-${Date.now()}.png`
+    const filepath = path.join(UPLOADS_DIR, name)
+    execSync(`screencapture -x ${filepath}`)
+    return { url: `/uploads/${name}`, filename: name }
+  } catch (err) {
+    return reply.code(500).send({ error: 'Screenshot failed: ' + err.message })
   }
-  messages.push(message)
-  return message
 })
 
-// Create HTTP server
+// ══════════════ AI CHAT ══════════════
+fastify.post('/api/chat', async (req, reply) => {
+  const { agentId, message, history, imageBase64 } = req.body
+  const c = loadConfig()
+  const agent = c.agents.find(a => a.id === agentId)
+  if (!agent) return reply.code(404).send({ error: 'Agent not found' })
+  if (!agent.enabled) return reply.code(400).send({ error: 'Agent is disabled' })
+  if (!agent.apiKey && agent.provider !== 'ollama') return reply.code(400).send({ error: 'No API key' })
+
+  // Inject rules into system prompt
+  const rules = c.rules || []
+  const rulesText = rules.length > 0 ? '\n\nCOMPANY RULES (you must follow these):\n' + rules.map((r, i) => `${i + 1}. ${r}`).join('\n') : ''
+
+  // Inject visible MCPs and projects context
+  const perms = agent.permissions || []
+  let contextText = ''
+  if (perms.includes('mcps') && c.mcps?.length > 0) {
+    const visible = c.mcps.filter(m => !m.hiddenFrom || !m.hiddenFrom.includes(agentId))
+    if (visible.length > 0) contextText += '\n\nACTIVE MCPs:\n' + visible.map(m => `- ${m.name}: ${m.description || ''} (${m.url || ''})`).join('\n')
+  }
+  if (perms.includes('projects') && c.projects?.length > 0) {
+    contextText += '\n\nPROJECTS:\n' + c.projects.map(p => `- ${p.name}: ${p.description || ''} [${p.progress || 0}% complete] (${p.repo || ''})`).join('\n')
+  }
+  if (perms.includes('webhooks') && c.services?.length > 0) {
+    contextText += '\n\nCONNECTED SERVICES:\n' + c.services.map(s => `- ${s.name}: ${s.type} (${s.url || ''})`).join('\n')
+  }
+
+  // Inject assigned tasks
+  const tasks = agent.tasks || []
+  let tasksText = ''
+  if (tasks.length > 0) tasksText = '\n\nYOUR ASSIGNED TASKS:\n' + tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')
+
+  // Special ideas channel context
+  const channelId = req.body.channelId || ''
+  let channelContext = ''
+  if (channelId === 'general') {
+    channelContext = '\n\nYou are in #general — the team room. Everyone is here: Aimar (CEO), and the other AI agents. This is a group conversation. You can respond to anyone — the CEO or other agents. Keep it natural, like coworkers chatting. Be concise. If another agent said something you agree or disagree with, respond to them directly. The messages show who said what in [Name]: format.'
+  } else if (channelId === 'ideas') {
+    channelContext = '\n\nYou are in #ideas. The CEO pitched an idea. Analyze from YOUR expertise and propose HOW to make it happen. Be specific — tools, timeline, architecture, costs, research. Be constructive. The messages show who said what in [Name]: format. You can also respond to other agents\' proposals.'
+  }
+
+  const fullSystemPrompt = agent.systemPrompt + rulesText + contextText + tasksText + channelContext
+
+  try {
+    let responseText = ''
+    if (agent.provider === 'anthropic') {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': agent.apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: agent.model || 'claude-sonnet-4-20250514', max_tokens: 500, system: fullSystemPrompt, messages: [...(history || []).slice(-10), { role: 'user', content: message }] }),
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error.message)
+      responseText = data.content?.[0]?.text || 'No response'
+    } else if (agent.provider === 'openai') {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${agent.apiKey}` },
+        body: JSON.stringify({ model: agent.model || 'gpt-4o', max_tokens: 500, messages: [{ role: 'system', content: fullSystemPrompt }, ...(history || []).slice(-10), { role: 'user', content: message }] }),
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error.message)
+      responseText = data.choices?.[0]?.message?.content || 'No response'
+    } else if (agent.provider === 'ollama') {
+      const userMsg = imageBase64
+        ? { role: 'user', content: message || 'What do you see in this image?', images: [imageBase64.replace(/^data:image\/\w+;base64,/, '')] }
+        : { role: 'user', content: message }
+      const res = await fetch('http://localhost:11434/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: agent.model || 'gemma3:4b', stream: false, messages: [{ role: 'system', content: fullSystemPrompt }, ...(history || []).slice(-10), userMsg] }),
+      })
+      const data = await res.json()
+      responseText = data.message?.content || 'No response'
+    } else if (agent.provider === 'custom') {
+      const res = await fetch(agent.model, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${agent.apiKey}` }, body: JSON.stringify({ message, history }) })
+      const data = await res.json()
+      responseText = data.response || data.content || data.message || JSON.stringify(data)
+    }
+    return { response: responseText }
+  } catch (err) {
+    console.error(`Agent ${agentId} error:`, err.message)
+    return reply.code(500).send({ error: err.message })
+  }
+})
+
+// ══════════════ START ══════════════
 const start = async () => {
   try {
     const port = process.env.PORT || 3001
     await fastify.listen({ port: Number(port), host: '0.0.0.0' })
-
-    // Setup Socket.io
-    const io = new Server(fastify.server, {
-      cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
-      }
-    })
-
+    io = new Server(fastify.server, { cors: { origin: '*', methods: ['GET', 'POST'] } })
     io.on('connection', (socket) => {
       console.log('Client connected:', socket.id)
-
-      socket.on('join', (userId) => {
-        socket.userId = userId
-        console.log(`User ${userId} joined`)
-
-        // Broadcast user online
-        users = users.map(u =>
-          u.id === userId ? { ...u, online: true } : u
-        )
-        io.emit('users:update', users)
-      })
-
-      socket.on('message', (data) => {
-        const message = {
-          id: Date.now().toString(),
-          content: data.content,
-          senderId: data.senderId,
-          receiverId: data.receiverId,
-          createdAt: new Date().toISOString()
-        }
-        messages.push(message)
-
-        // Emit to both sender and receiver
-        io.emit('message:new', message)
-      })
-
-      socket.on('disconnect', () => {
-        console.log('Client disconnected:', socket.id)
-        if (socket.userId) {
-          // Broadcast user offline
-          users = users.map(u =>
-            u.id === socket.userId ? { ...u, online: false } : u
-          )
-          io.emit('users:update', users)
-        }
-      })
+      socket.on('disconnect', () => console.log('Client disconnected:', socket.id))
     })
-
+    const c = loadConfig()
     console.log(`Server running on http://localhost:${port}`)
-  } catch (err) {
-    fastify.log.error(err)
-    process.exit(1)
-  }
+    console.log(`Agents: ${c.agents.length} | Projects: ${(c.projects||[]).length} | MCPs: ${(c.mcps||[]).length}`)
+  } catch (err) { fastify.log.error(err); process.exit(1) }
 }
-
 start()

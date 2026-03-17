@@ -37,3 +37,5 @@ logs
 
 # Testing
 coverage/
+kayou-config.json
+out/uploads/
